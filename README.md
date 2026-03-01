@@ -1,4 +1,6 @@
 ## SafeDrive AI ##
+
+Check thermal_ai_control_v1_legacy.py for the initial threshold-based logic and thermal_ai_control_v2_optimized.py for the current PyTorch implementation.
 An AI-driven motor protection system developed with **PyTorch**. This project is designed to enhance the safety and longevity of industrial motors by implementing intelligent control logic.
 
 >Key Features
