@@ -1,12 +1,19 @@
 # ============================================================
 #   SafeDrive-AI  —  Son Sürüm (Tüm Hatalar Düzeltildi)
 #   Yazar  : SafeDrive-AI Projesi
-#   Versiyon: 2.4
+#   Versiyon: 2.6
+#   NOT: Canlı dashboard PyQtGraph'tan matplotlib FuncAnimation'a
+#        geri döndürüldü (2.4'teki okunabilir/ölçekli versiyon).
+#        Stres testi + baseline karşılaştırma grafikleri korunuyor.
+#   NOT2: PyQtGraph/QApplication tamamen kaldırıldı; bu nedenle
+#         "GUI thread warnings if QApplication not initialized"
+#         known issue'su artık geçerli değil (kaynağı yok).
 # ============================================================
 
 import os
 import math
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,11 +21,45 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
+import requests
 
 # Tekrarlanabilirlik için seed sabitle
 random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
+
+# ============================================================
+# TELEGRAM BOT — UZAKTAN UYARI SİSTEMİ
+# ============================================================
+#   GÜVENLİK: Token'ı koda yazmak yerine ortam değişkeninden
+#   okuyoruz. Çalıştırmadan önce terminalde ayarla:
+#     Windows (PowerShell): $env:SAFEDRIVE_BOT_TOKEN="..."
+#                            $env:SAFEDRIVE_CHAT_ID="..."
+#   Ayarlanmazsa Telegram bildirimleri sessizce atlanır.
+# ============================================================
+BOT_TOKEN = os.environ.get("SAFEDRIVE_BOT_TOKEN", "")
+CHAT_ID   = os.environ.get("SAFEDRIVE_CHAT_ID", "")
+TELEGRAM_AKTIF = bool(BOT_TOKEN and CHAT_ID)
+
+if not TELEGRAM_AKTIF:
+    print("  ℹ Telegram bildirimleri devre dışı "
+          "(SAFEDRIVE_BOT_TOKEN / SAFEDRIVE_CHAT_ID tanımlı değil).\n")
+
+
+def telegram_mesaj_gonder(metin: str):
+    """Telegram'a uyarı mesajı gönderir. Token/ChatID yoksa no-op."""
+    if not TELEGRAM_AKTIF:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": metin}
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            print(f"  --> [TELEGRAM] İletildi: {metin[:40]}...")
+        else:
+            print(f"  --> [TELEGRAM] Hata! Kod: {response.status_code}")
+    except Exception as e:
+        print(f"  --> [TELEGRAM] Bağlantı hatası: {e}")
 
 # Grafik kayıt dizini: betiğin yanına kaydeder (Windows uyumlu)
 try:
@@ -30,11 +71,6 @@ print(f"Grafikler şuraya kaydedilecek: {CIKTI_DIZIN}")
 
 # ============================================================
 # 1.  MODEL — DÜZELTILMIŞ MULTİ-HEAD MİMARİ
-# ============================================================
-#   Eski hatalar:
-#     • state + x[:,1:2]  → boyut uyumsuzluğu, fiziksel anlamsızlık
-#     • Çok küçük ağ (7→32→16) → öğrenme kapasitesi yetersiz
-#     • Tek lineer head → karar sınırı çok kaba
 # ============================================================
 class MotorKoruyucuAI(nn.Module):
     def __init__(self):
@@ -53,8 +89,6 @@ class MotorKoruyucuAI(nn.Module):
         )
 
         # ---- Skip Connection Projeksiyonu (7 → 16) ----
-        # ESKİ KOD: state + x[:,1:2]  → 16 boyuta 1 boyut ekleniyordu (YANLIŞ)
-        # YENİ KOD: tam boyut eşleştirme ile anlamlı artık bağlantı
         self.skip_proj = nn.Linear(7, 16, bias=False)
 
         # ---- Head 1: Gaz Kesme (Sürekli 0–1) ----
@@ -72,19 +106,14 @@ class MotorKoruyucuAI(nn.Module):
         )
 
     def forward(self, x):
-        state = self.state_net(x) + self.skip_proj(x)   # artık boyutlar eşit
+        state = self.state_net(x) + self.skip_proj(x)
         gaz_kesme  = torch.sigmoid(self.control_head(state))
         ariza_risk = torch.sigmoid(self.fault_head(state))
         return gaz_kesme, ariza_risk
 
 
 # ============================================================
-# 2.  EĞİTİM VERİSİ — ZENGİN & GERÇEKÇİ
-# ============================================================
-#   Eski hatalar:
-#     • Sadece 54 örnek → aşırı öğrenme (overfitting) kaçınılmaz
-#     • Titreşim ve akım sabit → model bu özellikleri öğrenemedi
-#     • Gürültü yok → gerçek sensör verisiyle uyumsuzluk
+# 2.  EĞİTİM VERİSİ — ZENGİN 
 # ============================================================
 def veri_uret(n_ornek: int = 3000):
     X, Y_gaz, Y_ariza = [], [], []
@@ -99,25 +128,20 @@ def veri_uret(n_ornek: int = 3000):
         titresim = random.uniform(0.05, 0.95)
         voltaj   = random.uniform(0.55, 1.05)
 
-        # ---- Gaz kesme etiketi (sıcaklık + titreşim etkili) ----
         if   t < 68:   kesme = 0.0
         elif t < 75:   kesme = (t - 68) / 70.0
         elif t < 85:   kesme = 0.10 + (t - 75) * 0.028
         elif t < 95:   kesme = 0.38 + (t - 85) * 0.062
         else:          kesme = 1.0
 
-        # Yüksek titreşim → ek kesme
         if titresim > 0.60:
             kesme = min(1.0, kesme + (titresim - 0.60) * 0.45)
 
-        # Yüksek akım → hafif kesme
         if akim > 0.75:
             kesme = min(1.0, kesme + (akim - 0.75) * 0.20)
 
-        # ---- Arıza etiketi (titreşim & akım birlikte yüksekse) ----
         ariza = 1.0 if (titresim > 0.62 and akim > 0.62) else 0.0
 
-        # ---- Sensor gürültüsü ----
         def n(std=0.008): return random.gauss(0, std)
 
         X.append([
@@ -142,12 +166,8 @@ def veri_uret(n_ornek: int = 3000):
 # ============================================================
 # 3.  EĞİTİM DÖNGÜSÜ + MODEL KAYDET / YÜKLE
 # ============================================================
-#   İlk çalıştırma : eğitir → motor_koruyucu.pth kaydeder
-#   Sonraki çalıştırmalar: .pth varsa yükler, eğitimi atlar (~30s kazanç)
-#   Zorla yeniden eğitmek için: MODEL_DOSYASI'nı sil veya ZORLA_EGIT=True yap
-# ============================================================
 MODEL_DOSYASI = os.path.join(CIKTI_DIZIN, "motor_koruyucu.pth")
-ZORLA_EGIT    = False   # True yapınca kayıtlı model olsa bile yeniden eğitir
+ZORLA_EGIT    = False
 
 print("=" * 55)
 print("  SafeDrive-AI  —  Model Yönetimi")
@@ -156,14 +176,12 @@ print("=" * 55)
 model = MotorKoruyucuAI()
 
 if os.path.exists(MODEL_DOSYASI) and not ZORLA_EGIT:
-    # ---- Model Yükleme ----
     model.load_state_dict(torch.load(MODEL_DOSYASI, weights_only=True))
     model.eval()
     print(f"  ✓ Kayıtlı model yüklendi  →  {MODEL_DOSYASI}")
     print("    (Yeniden eğitmek için ZORLA_EGIT = True yapın)\n")
 
 else:
-    # ---- Model Eğitimi ----
     if ZORLA_EGIT:
         print("  ⚡ ZORLA_EGIT=True — model sıfırdan eğitiliyor...")
     else:
@@ -199,7 +217,6 @@ else:
             print(f"  Epoch {epoch:>4} | GazLoss: {loss_gaz:.4f} "
                   f"| ArizaLoss: {loss_ariza:.4f} | LR: {lr:.6f}")
 
-    # ---- Kaydet ----
     torch.save(model.state_dict(), MODEL_DOSYASI)
     print(f"\n  ✓ Model kaydedildi  →  {MODEL_DOSYASI}")
     print("  Eğitim tamamlandı.\n")
@@ -236,8 +253,6 @@ print()
 # ============================================================
 # 5.  PID DENETLEYİCİ — ANTİ-WİNDUP'LI
 # ============================================================
-#   Eski hata: integral sınırsız büyüyebiliyordu (windup riski)
-# ============================================================
 class PID:
     def __init__(self, kp=0.8, ki=0.1, kd=0.05, dt=1.0,
                  integral_limit=8.0):
@@ -270,11 +285,6 @@ class PID:
 # 6.  FAIL-SAFE — ÇOKLU SERT SINIR
 # ============================================================
 def fail_safe(sensor: torch.Tensor, ariza_risk: float):
-    """
-    Sensör değerlerine ve model çıktısına göre
-    acil durdurma kararı verir.
-    Döndürür: (durdur: bool, sebep: str)
-    """
     if torch.isnan(sensor).any() or torch.isinf(sensor).any():
         return True, "SENSOR_HATASI"
 
@@ -300,38 +310,30 @@ class MotorKontrolSistemi:
     def __init__(self, model: nn.Module):
         self.model = model
         self.pid   = PID(kp=0.8, ki=0.1, kd=0.05)
-        self.guc   = 1.0          # anlık motor gücü [0-1]
+        self.guc   = 1.0
 
     def reset(self):
         self.guc = 1.0
         self.pid.reset()
 
     def adim(self, sensor: torch.Tensor):
-        """
-        Bir zaman adımı çalıştır.
-        Döndürür: (guc, gaz_kesme, ariza, durum_str)
-        """
         self.model.eval()
         with torch.no_grad():
             gaz_kesme, ariza = self.model(sensor)
         gaz_val   = float(gaz_kesme)
         ariza_val = float(ariza)
 
-        # Fail-safe kontrolü
         dur, sebep = fail_safe(sensor, ariza_val)
         if dur:
             self.guc = 0.0
             return 0.0, gaz_val, ariza_val, f"FAIL-SAFE:{sebep}"
 
-        # NN → hedef güç
         hedef = 1.0 - gaz_val
 
-        # PID → yumuşat
         pid_cikti = self.pid.step(setpoint=hedef,
                                   measurement=self.guc)
         self.guc = float(np.clip(self.guc + pid_cikti, 0.0, 1.0))
 
-        # Uyarı eşiği
         T0 = sensor[0, 1].item() * 100.0
         if T0 >= 80:
             durum = "UYARI:SICAK"
@@ -346,19 +348,15 @@ class MotorKontrolSistemi:
 # ============================================================
 # 8.  MOTOR FİZİĞİ — EULER YÖNTEMI
 # ============================================================
-#   dT/dt = α·P + γ·Vib - β·(T - T_ortam) + ekstra_yuk
-#   Katsayılar gerçek bir taşıt motoruna yakın kalibre edildi.
-#   Eski kod: alpha=0.6 (çok yüksekti; motor asla soğumuyordu)
-# ============================================================
 def motor_fizigi(T: float,
                  guc: float,
                  titresim: float  = 0.0,
                  ekstra_yuk: float = 0.0,
                  ortam_T: float   = 25.0,
                  dt: float        = 1.0) -> float:
-    alpha  = 0.55   # ısınma katsayısı (artırıldı: motor gerçekçi ısınsın)
-    beta   = 0.028  # soğuma katsayısı (azaltıldı: gerçek motor yavaş soğur)
-    gamma  = 1.40   # titreşim ısı katkısı (artırıldı: titreşim ciddi ısı üretir)
+    alpha  = 0.55
+    beta   = 0.028
+    gamma  = 1.40
 
     isinma = alpha * guc + gamma * max(0.0, titresim - 0.3)
     soguma = beta  * (T - ortam_T)
@@ -369,11 +367,6 @@ def motor_fizigi(T: float,
 # 9.  BASELINE KONTROL YÖNTEMLERİ (Karşılaştırma)
 # ============================================================
 def baseline_threshold(T_derece: float) -> float:
-    """
-    Baseline-1: Sabit eşik tabanlı kontrol.
-    Gerçek dünya uygulamalarında hâlâ yaygın kullanılan
-    basit kural tabanlı yöntem.
-    """
     if   T_derece >= 95: return 0.00
     elif T_derece >= 80: return 0.55
     else:                return 1.00
@@ -382,10 +375,6 @@ def baseline_threshold(T_derece: float) -> float:
 def baseline_pid_only(pid_b: PID,
                       T_derece: float,
                       mevcut_guc: float) -> float:
-    """
-    Baseline-2: Saf PID kontrolü.
-    Hedef sıcaklık: 72°C. Arıza bilgisi yok.
-    """
     hata    = 72.0 - T_derece
     cikti   = pid_b.step(setpoint=0.0, measurement=-hata)
     return float(np.clip(mevcut_guc + cikti * 0.05, 0.0, 1.0))
@@ -393,10 +382,6 @@ def baseline_pid_only(pid_b: PID,
 
 def baseline_nn_only(model: nn.Module,
                      sensor: torch.Tensor) -> float:
-    """
-    Baseline-3: PID yumuşatması olmadan saf NN kararı.
-    Ani gaz değişimlerine karşı savunmasızdır.
-    """
     model.eval()
     with torch.no_grad():
         gaz_kesme, _ = model(sensor)
@@ -407,13 +392,9 @@ def baseline_nn_only(model: nn.Module,
 # 10. STRES TEST SENARYOLARI
 # ============================================================
 def stres_senaryosu(t: int, senaryo: str) -> dict:
-    """
-    Her adımda dinamik sensör değerleri üretir.
-    t_mod ile döngüsel çalışır → dashboard'da sonsuza kadar tekrarlar.
-    """
     def n(std=0.02): return random.gauss(0, std)
 
-    t_mod = t % 85   # 85 saniyelik döngü — dashboard için kritik
+    t_mod = t % 85
 
     if senaryo == "normal":
         return dict(hiz=0.65+n(0.015), akim=0.48+n(0.025),
@@ -459,14 +440,10 @@ def stres_senaryosu(t: int, senaryo: str) -> dict:
 # ============================================================
 def stres_testi_calistir(senaryo_adi: str,
                           sure: int = 120) -> dict:
-    """
-    Belirli bir senaryoyu simüle eder.
-    Başlangıç sıcaklığı 55°C (motor zaten ısınmış halde başlar).
-    """
     sistem = MotorKontrolSistemi(model)
     sistem.reset()
 
-    T     = 55.0   # Gerçekçi: motor çalışıyor, zaten ısınmış
+    T     = 55.0
     T_his = [54.0, 53.0]
 
     t_seri, T_seri, P_seri, R_seri, D_seri = [], [], [], [], []
@@ -508,17 +485,11 @@ def stres_testi_calistir(senaryo_adi: str,
 # 12. BASELINE KARŞILAŞTIRMA RUNNER
 # ============================================================
 def baseline_karsilastir(sure: int = 120) -> dict:
-    """
-    SafeDrive-AI vs Threshold vs PID-Only vs NN-Only
-    Hepsini aynı 'ani_yuk' senaryosunda karşılaştırır.
-    """
     senaryo = "ani_yuk"
 
-    # SafeDrive-AI
     ai_sistem = MotorKontrolSistemi(model)
     ai_sistem.reset()
 
-    # Baseline-2 PID
     pid_b = PID(kp=0.5, ki=0.08, kd=0.03)
     pid_b_guc = 1.0
 
@@ -545,22 +516,17 @@ def baseline_karsilastir(sure: int = 120) -> dict:
                 float(np.clip(T_h[1]/100.0,   0.0, 1.0)),
             ]], dtype=torch.float32)
 
-        # SafeDrive-AI
         s_ai  = make_sensor(T_ai,  Th_ai)
         P_ai, _, _, _ = ai_sistem.adim(s_ai)
 
-        # Baseline-1: Threshold
         P_thr = baseline_threshold(T_thr)
 
-        # Baseline-2: PID Only
         P_pid = baseline_pid_only(pid_b, T_pid, pid_b_guc)
         pid_b_guc = P_pid
 
-        # Baseline-3: NN Only
         s_nn  = make_sensor(T_nn, Th_nn)
         P_nn  = baseline_nn_only(model, s_nn)
 
-        # Fizik güncelle
         kw = dict(titresim=sv["titresim"], ekstra_yuk=sv["ekstra_yuk"])
         T_ai_y  = motor_fizigi(T_ai,  P_ai,  **kw)
         T_thr_y = motor_fizigi(T_thr, P_thr, **kw)
@@ -612,7 +578,6 @@ for col, (isim, kod) in enumerate(SENARYOLAR.items()):
     ax_P = axes[1][col]
     ax_R = axes[2][col]
 
-    # Sıcaklık
     ax_T.plot(sonuc["t"], sonuc["T"], color=C_SICAK, linewidth=2)
     ax_T.axhline(95, color="red",    linestyle="--", lw=1.2, label="95°C Krit.")
     ax_T.axhline(80, color="orange", linestyle=":",  lw=1.0, label="80°C Uyarı")
@@ -622,13 +587,11 @@ for col, (isim, kod) in enumerate(SENARYOLAR.items()):
     ax_T.legend(fontsize=7, loc="lower right")
     ax_T.grid(True, alpha=0.3)
 
-    # Motor gücü
     ax_P.plot(sonuc["t"], sonuc["P"], color=C_GUC, linewidth=2)
     ax_P.set_ylim(0, 108)
     ax_P.set_ylabel(ROW_LABELS[1] if col == 0 else "")
     ax_P.grid(True, alpha=0.3)
 
-    # Arıza riski
     ax_R.fill_between(sonuc["t"], sonuc["R"], color=C_RISK, alpha=0.40)
     ax_R.plot(sonuc["t"], sonuc["R"], color=C_RISK, linewidth=1.8)
     ax_R.axhline(70, color="red", linestyle="--", lw=1, label="Risk Eşiği %70")
@@ -697,26 +660,6 @@ print(f"  ✓ Baseline grafiği kaydedildi: {dosya_bl}")
 # ============================================================
 # 15. CAN BUS SİMÜLASYONU
 # ============================================================
-#   Gerçek araçlarda sensörler CAN Bus protokolü üzerinden
-#   8 byte'lık mesajlar halinde iletilir. Her mesajın bir
-#   ID'si, ölçek faktörü ve offset değeri vardır.
-#
-#   Bu modül:
-#     1. Araç durumunu ham CAN frame'lerine kodlar  (encode)
-#     2. Frame'leri çözerek normalize sensör verisine dönüştürür (decode)
-#     3. Decode edilen veriyi doğrudan AI modeline gönderir
-#
-#   Kullanılan ID'ler (OBD-II / SAE J1939 standardına yakın):
-#     0x0C8 → Motor RPM          (0–8000 rpm,  2 byte)
-#     0x130 → Soğutucu Sıcaklığı (0–150 °C,   1 byte)
-#     0x1A0 → Gaz Kelebeği %     (0–100 %,     1 byte)
-#     0x3B0 → Batarya Voltajı    (0–16 V,      1 byte, x0.1)
-#     0x4A0 → Titreşim           (0–100 g,     1 byte, x0.01)
-#     0x5C0 → Motor Akımı        (0–500 A,     2 byte, x0.1)
-#     0x6D0 → Araç Hızı          (0–300 km/h,  1 byte)
-# ============================================================
-
-# CAN ID tanımları: {id: (isim, max_değer, byte_sayısı, ölçek)}
 CAN_TANIM = {
     0x0C8: ("RPM",      8000.0, 2, 1.0  ),
     0x130: ("SICAKLIK", 150.0,  1, 1.0  ),
@@ -729,10 +672,6 @@ CAN_TANIM = {
 
 
 def can_encode(rpm, sicaklik, gaz, voltaj, titresim, akim, hiz):
-    """
-    Gerçek değerleri CAN frame byte dizilerine kodlar.
-    Her frame 8 byte; kullanılmayan byte'lar 0x00 ile doldurulur.
-    """
     def enc(val, max_val, n_byte, scale):
         raw = int(round(float(np.clip(val, 0, max_val)) / scale))
         raw = min(raw, (256 ** n_byte) - 1)
@@ -742,23 +681,19 @@ def can_encode(rpm, sicaklik, gaz, voltaj, titresim, akim, hiz):
         0x0C8: enc(rpm,            8000.0, 2, 1.0),
         0x130: enc(sicaklik,        150.0, 1, 1.0),
         0x1A0: enc(gaz,             100.0, 1, 1.0),
-        0x3B0: enc(voltaj * 10,     160.0, 1, 1.0),   # 0.1V çözünürlük
-        0x4A0: enc(titresim * 100, 10000,  1, 1.0),   # 0.01g çözünürlük
-        0x5C0: enc(akim * 10,      5000.0, 2, 1.0),   # 0.1A çözünürlük
+        0x3B0: enc(voltaj * 10,     160.0, 1, 1.0),
+        0x4A0: enc(titresim * 100, 10000,  1, 1.0),
+        0x5C0: enc(akim * 10,      5000.0, 2, 1.0),
         0x6D0: enc(hiz,             300.0, 1, 1.0),
     }
 
 
 def can_decode(frames):
-    """
-    CAN frame byte dizilerini gerçek fiziksel değerlere çözer.
-    Döndürür: {isim: gerçek_değer} sözlüğü
-    """
     sonuc = {}
     ozel_scale = {
-        0x3B0: 0.1,    # voltaj: raw * 0.1 → Volt
-        0x4A0: 0.01,   # titreşim: raw * 0.01 → g
-        0x5C0: 0.1,    # akım: raw * 0.1 → Amper
+        0x3B0: 0.1,
+        0x4A0: 0.01,
+        0x5C0: 0.1,
     }
     for can_id, (isim, max_val, n_byte, _) in CAN_TANIM.items():
         raw  = int.from_bytes(frames[can_id][:n_byte], byteorder="big")
@@ -768,30 +703,20 @@ def can_decode(frames):
 
 
 def can_to_sensor(decoded, T1_derece, T2_derece):
-    """
-    Decode edilmiş CAN verisini AI modeline girecek
-    normalize (0-1) tensöre dönüştürür.
-    """
     return torch.tensor([[
-        decoded["HIZ"]      / 300.0,    # hız
-        decoded["SICAKLIK"] / 150.0,    # T(t)
-        decoded["AKIM"]     / 500.0,    # akım
-        decoded["TITRESIM"] / 100.0,    # titreşim
-        decoded["VOLTAJ"]   / 16.0,     # voltaj
-        T1_derece           / 150.0,    # T(t-1)
-        T2_derece           / 150.0,    # T(t-2)
+        decoded["HIZ"]      / 300.0,
+        decoded["SICAKLIK"] / 150.0,
+        decoded["AKIM"]     / 500.0,
+        decoded["TITRESIM"] / 100.0,
+        decoded["VOLTAJ"]   / 16.0,
+        T1_derece           / 150.0,
+        T2_derece           / 150.0,
     ]], dtype=torch.float32)
 
 
 def can_bus_adim(t, senaryo, sicaklik, T1, T2, sistem):
-    """
-    Tek bir CAN Bus döngüsü:
-      encode → simüle CAN hattı → decode → tensor → AI+PID karar
-    Döndürür: (guc, ariza, durum, decoded_dict, ekstra_yuk)
-    """
     sv = stres_senaryosu(t, senaryo)
 
-    # Normalize sensör → gerçek birime çevir
     rpm        = sv["hiz"]      * 8000.0
     gaz_pct    = max(0.0, (1.0 - sv["akim"] * 0.3)) * 100.0
     voltaj_v   = sv["voltaj"]   * 16.0
@@ -808,7 +733,6 @@ def can_bus_adim(t, senaryo, sicaklik, T1, T2, sistem):
     return guc, ariza, durum, decoded, sv["ekstra_yuk"]
 
 
-# ---- CAN Bus Demo: 5 adım terminale yazdır ----
 print("-" * 55)
 print("  CAN Bus Simülasyon Demo  (5 adım, ani_yuk senaryosu)")
 print("-" * 55)
@@ -834,31 +758,34 @@ print()
 
 
 # ============================================================
-# 16. CANLI DASHBOARD — TAM DÜZELTILMIŞ
+# 16. CANLI DASHBOARD — MATPLOTLIB FuncAnimation (CAN Bus)
 # ============================================================
-#   Eski hatalar:
-#     • animate() global değişkenlere bağlıydı → animasyon donuyordu
-#     • ariza_risk = random.uniform(0,10) → sahte veri
-#     • 'power' scope hatası → NameError
-#   Düzeltmeler:
-#     • Tüm state dash_state sözlüğünde → her frame kendi adımını hesaplıyor
-#     • ariza gerçek model çıktısından geliyor
-#     • Hiçbir global değişkene bağımlılık yok
+#   2.5'teki PyQtGraph dashboard kaldırıldı (ölçek/eksen
+#   sorunları ve eksik bilgi nedeniyle). 2.4'teki matplotlib
+#   tabanlı, sabit eksenli, başlıkta canlı durum bilgisi
+#   gösteren dashboard'a geri dönüldü.
 # ============================================================
 
 AKTIF_SENARYO = "ani_yuk"   # değiştirilebilir: normal / ani_yuk /
                              # titresim_artisi / voltaj_dususu / soguk_baslangic
 PENCERE_BOYUTU = 60          # grafik penceresinde görünecek adım sayısı
 
-# Dashboard state: her şey burada, global değişken yok
 dash = {
     "sistem": MotorKontrolSistemi(model),
     "T":      55.0,
     "T_his":  [54.0, 53.0],
     "t":      0,
     "x":      [], "T_y": [], "P_y": [], "R_y": [],
+    # --- Telegram bildirim takibi ---
+    "son_durum":    "NORMAL",
+    "son_mesaj_ts": 0.0,
+    "ariza_bildirildi": False,
 }
 dash["sistem"].reset()
+TELEGRAM_COOLDOWN = 30.0   # saniye: aynı tür uyarı en az bu kadar arayla gönderilir
+
+if TELEGRAM_AKTIF:
+    telegram_mesaj_gonder("🤖 SafeDrive-AI Sistemi Aktif! Motor izleniyor...")
 
 fig_dash = plt.figure(figsize=(12, 8))
 fig_dash.suptitle(
@@ -875,7 +802,6 @@ def animate(frame):
     t = d["t"]
     T = d["T"]
 
-    # CAN Bus pipeline: encode → decode → tensor → AI+PID
     guc, ariza, durum, decoded, ekstra_yuk = can_bus_adim(
         t, AKTIF_SENARYO,
         sicaklik = T,
@@ -890,7 +816,6 @@ def animate(frame):
         ekstra_yuk= ekstra_yuk,
     )
 
-    # State güncelle
     d["T_his"] = [T, d["T_his"][0]]
     d["T"]     = T_yeni
     d["t"]    += 1
@@ -898,7 +823,35 @@ def animate(frame):
     d["x"].append(t);          d["T_y"].append(T)
     d["P_y"].append(guc*100);  d["R_y"].append(ariza*100)
 
-    # Kayan pencere
+    # ---- Telegram Uyarıları ----
+    now = time.time()
+    if TELEGRAM_AKTIF and (now - d["son_mesaj_ts"] > TELEGRAM_COOLDOWN):
+        if durum.startswith("FAIL-SAFE"):
+            telegram_mesaj_gonder(
+                f"🚨 ACİL DURDURMA! Sebep: {durum.split(':',1)[1]} "
+                f"| Sıcaklık: {T:.1f}°C | Motor gücü %0'a çekildi."
+            )
+            d["son_mesaj_ts"] = now
+
+        elif ariza > 0.7 and not d["ariza_bildirildi"]:
+            telegram_mesaj_gonder(
+                f"⚠️ UYARI: Mekanik arıza riski %{ariza*100:.0f}'e yükseldi! "
+                f"Sıcaklık: {T:.1f}°C | Motor gücü %{guc*100:.0f}'e kısıldı."
+            )
+            d["son_mesaj_ts"] = now
+            d["ariza_bildirildi"] = True
+
+        elif durum == "UYARI:SICAK" and d["son_durum"] != "UYARI:SICAK":
+            telegram_mesaj_gonder(
+                f"🔥 UYARI: {T:.1f}°C yüksek sıcaklık tespit edildi! "
+                f"SafeDrive-AI motor gücünü %{guc*100:.0f}'e kıstı."
+            )
+            d["son_mesaj_ts"] = now
+
+    if ariza <= 0.7:
+        d["ariza_bildirildi"] = False
+    d["son_durum"] = durum
+
     if len(d["x"]) > PENCERE_BOYUTU:
         for lst in (d["x"], d["T_y"], d["P_y"], d["R_y"]):
             lst.pop(0)
