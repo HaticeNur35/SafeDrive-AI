@@ -106,13 +106,18 @@ Program çalıştığında betiğin bulunduğu klasöre şu dosyaları kaydeder:
 
 Canlı dashboard, `python safedrive_ai.py` çalıştığında ayrı bir pencerede açılır.
 
+## Sonuçlar
+
+![Stres testi](docs/stres_testi.png)
+![Baseline karşılaştırması](docs/baseline_karsilastirma.png)
+
 ## Sınırlılıklar
 
 - Eğitim verisi kurallarla sentetik olarak üretilmiştir. Model gerçek motor sensör verisiyle doğrulanmamıştır.
 - Fiziksel model (ısınma ve soğuma katsayıları) basitleştirilmiş bir termal modeldir.
 - CAN Bus katmanı bir simülasyondur; gerçek bir araç ağına bağlanmamıştır.
 - Sonraki adım: gerçek sensör verisiyle test ve model doğrulaması.
-- Stres testlerinde motor gücü, ani yük ve titreşim senaryolarında hızlı açılıp kapanmaktadır (anahtar benzeri davranış). Bu, PID yumuşatmasının ve karar eşiklerinin ayarlanması gerektiğini göstermektedir. Arıza riski de ani yük senaryosunda sık sık eşiğin üstüne çıkmaktadır.
+- Stres testlerinde motor gücü, ani yük ve titreşim senaryolarında hızlı açılıp kapanmaktadır (anahtar benzeri davranış). Bu, PID düzeltmesinin ve karar eşiklerinin ayarlanması gerektiğini göstermektedir. Arıza riski de ani yük senaryosunda sık sık eşiğin üstüne çıkmaktadır.
 
 ## Sürüm Geçmişi
 
