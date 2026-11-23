@@ -2,16 +2,12 @@
 
 > Yapay zekâ destekli motor koruma ve termal kontrol sistemi
 
-SafeDrive-AI, bir motorun sıcaklık, titreşim, akım, voltaj ve hız verilerini izleyerek
-gaz kesme kararı üreten ve motoru kademeli olarak koruyan bir sistemdir. Sert bir acil durdurma
-yerine sensör verisine göre sürekli ve yumuşak bir güç ayarı yapar. Kritik durumlarda ise
-sert sınırlar (fail-safe) devreye girer ve isteğe bağlı olarak Telegram üzerinden uyarı gönderir.
-
+SafeDrive-AI, bir motorun sıcaklık, titreşim, akım, voltaj ve hız verilerini izleyerek gaz kesme kararı üreten ve motoru koruyan bir sistemdir. Karar, sensör verisine göre sürekli bir değer olarak üretilir ve PID denetleyici ile uygulanır. Kritik durumlarda ise sert sınırlar (fail-safe) devreye girer ve isteğe bağlı olarak Telegram üzerinden uyarı gönderir.
 ## Temel Özellikler
 
 - **Kademeli güç kesme:** Sabit eşikler yerine sinir ağının ürettiği sürekli bir gaz kesme kararı.
 - **Mekanik arıza riski tahmini:** Çok başlı (multi-head) mimaride ikinci bir çıktı.
-- **PID ile yumuşatma:** Ani güç değişimlerini azaltan, integral sınırlı (anti-windup) PID denetleyici.
+- **PID ile düzeltme**: Ani güç değişimlerini sınırlamayı amaçlayan, integral sınırlı (anti-windup) PID denetleyici.
 - **Fail-safe sınırları:** Aşırı sıcaklık, aşırı titreşim, düşük voltaj, arıza riski ve sensör hatası için sert durdurma.
 - **Telegram uyarıları (isteğe bağlı):** Acil durdurma, mekanik arıza ve yüksek sıcaklık durumlarında mesaj gönderir.
 - **CAN Bus simülasyonu:** Sensör verileri OBD-II / SAE J1939 benzeri 8 baytlık çerçevelerle kodlanıp çözülür.
@@ -116,6 +112,7 @@ Canlı dashboard, `python safedrive_ai.py` çalıştığında ayrı bir pencered
 - Fiziksel model (ısınma ve soğuma katsayıları) basitleştirilmiş bir termal modeldir.
 - CAN Bus katmanı bir simülasyondur; gerçek bir araç ağına bağlanmamıştır.
 - Sonraki adım: gerçek sensör verisiyle test ve model doğrulaması.
+- Stres testlerinde motor gücü, ani yük ve titreşim senaryolarında hızlı açılıp kapanmaktadır (anahtar benzeri davranış). Bu, PID yumuşatmasının ve karar eşiklerinin ayarlanması gerektiğini göstermektedir. Arıza riski de ani yük senaryosunda sık sık eşiğin üstüne çıkmaktadır.
 
 ## Sürüm Geçmişi
 
