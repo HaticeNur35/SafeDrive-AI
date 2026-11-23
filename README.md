@@ -1,28 +1,97 @@
-## SafeDrive AI ##
+# SafeDrive-AI
 
-Check thermal_ai_control_v1_legacy.py for the initial threshold-based logic and thermal_ai_control_v2_optimized.py for the current PyTorch implementation.
-An AI-driven motor protection system developed with **PyTorch**. This project is designed to enhance the safety and longevity of industrial motors by implementing intelligent control logic.
+> Yapay zekâ destekli motor koruma ve termal kontrol sistemi
 
->Key Features
-Gradual Throttle Reduction:Unlike traditional emergency stops, this system implements a multi-stage throttle reduction based on real-time sensor data.
-Smart Monitoring:Continuously analyzes thermal and vibration levels to prevent hardware failure.
-Autonomous Safety:Optimized for low-cost COTS (Commercial Off-The-Shelf) components, making it accessible for diverse engineering applications.
+SafeDrive-AI, bir motorun sıcaklık, titreşim, akım, voltaj ve hız verilerini izleyerek
+gaz kesme kararı üreten ve motoru kademeli olarak koruyan bir sistemdir. Sert bir acil durdurma
+yerine, sensör verisine göre sürekli ve yumuşak bir güç ayarı yapar.
 
->Technical Overview
-The model is trained to process multiple sensor inputs and determine the safest operating state for the motor.
-Framework:PyTorch
-Language:Python
-Logic:The system calculates a safety factor (/S/) based on thermal input (/T/) and vibration magnitude (/V/): /S/ = /f(T, V)/
+## Temel Özellikler
 
->Multi-Stage Safety Protocol:
-Stage 1 (Warning):%20 Reduction when initial thresholds are met.
-Stage 2 (Critical):%50 Reduction to prevent immediate damage.
-Stage 3 (Emergency):Full Cut-off to ensure total hardware safety.
+- **Kademeli güç kesme:** Sabit eşikler yerine sinir ağının ürettiği sürekli bir karar.
+- **Mekanik arıza riski tahmini:** Çok başlı (multi-head) mimaride ikinci bir çıktı.
+- **PID ile yumuşatma:** Ani güç değişimlerini azaltan anti-windup korumalı PID denetleyici.
+- **Fail-safe sınırları:** Aşırı sıcaklık, aşırı titreşim, düşük voltaj ve sensör hatası için sert durdurma.
+- **CAN Bus simülasyonu:** Sensör verileri OBD-II / SAE J1939 benzeri 8 baytlık çerçevelerle kodlanıp çözülür.
+- **Stres testleri:** Normal sürüş, ani yük, titreşim artışı ve voltaj düşüşü senaryoları.
+- **Karşılaştırma:** SafeDrive-AI, eşik tabanlı kontrol, yalnızca PID ve yalnızca sinir ağı yöntemleriyle karşılaştırılır.
+- **Canlı dashboard:** `FuncAnimation` ile 300 ms aralıklı gerçek zamanlı grafik.
 
-**Model Evolution & OptimizationThe development of SafeDrive-AI**
-involved significant iterative improvements to ensure reliability and prevent system "panic" during operations.
->*Baseline (148 lines of code):* The initial version relied on rigid temperature thresholds (75°C, 85°C, 90°C without intermediate parameter processing.
->*The "Panic" Phenomenon:* At a high Mean Squared Error (MSE) of 0.169, the model was unstable—occasionally triggering an emergency shutdown at just 40°C while failing to react appropriately at 95°C.
->*Optimization Results:* By refining the PyTorch architecture and training parameters, the error rate was reduced from 0.169 to 0.0046.Current Reliability: The model now utilizes the parameter to maintain a smooth control curve, eliminating premature shutdowns and ensuring precise motor protection.
+## Mimari
 
+```
+Sensör girişi (7 özellik)
+        │
+        ├─ state_net (7→64→32→16, LayerNorm + Tanh)
+        │         │
+        │   skip_proj (7→16)
+        │         │
+        └──── state (16)
+                  │
+        ┌─────────┴──────────┐
+        │                    │
+  control_head           fault_head
+ (16→8→1, Sigmoid)    (16→8→1, Sigmoid)
+        │                    │
+  Gaz kesme [0-1]      Arıza riski [0-1]
+        │
+   PID (anti-windup)
+        │
+    Fail-safe
+        │
+  Motor gücü [0-1]
+```
 
+## Eğitim
+
+- 3.000 örnek, sensör gürültüsüyle birlikte üretilmiştir.
+- Gaz kesme etiketi sıcaklığa göre kademeli, titreşim ve akıma göre ek kesme içerir.
+- Arıza etiketi, yüksek titreşim ve yüksek akım birlikte olduğunda 1 olur.
+- Kayıp fonksiyonu: gaz kesme için SmoothL1, arıza için BCE; toplam kayıp `loss_gaz + 0.6 * loss_ariza`.
+- Optimizasyon: AdamW, CosineAnnealingLR, gradyan kırpma (`max_norm=1.0`).
+
+## Fail-Safe Eşikleri
+
+| Koşul | Eşik |
+|---|---|
+| Aşırı sıcaklık | T ≥ 98 °C |
+| Aşırı titreşim | titreşim > 0.90 |
+| Düşük voltaj | voltaj < 0.35 |
+| Mekanik arıza | arıza riski > 0.92 |
+| Sensör hatası | NaN veya sonsuz değer |
+
+## Kurulum
+
+```bash
+pip install torch numpy matplotlib
+python safedrive_ai.py
+```
+
+İlk çalıştırmada model eğitilip `motor_koruyucu.pth` olarak kaydedilir. Sonraki çalıştırmalarda
+kayıtlı model yüklenir. Sıfırdan eğitmek için `safedrive_ai.py` içinde `ZORLA_EGIT = True` yapın.
+
+## Sınırlılıklar
+
+- Eğitim verisi kurallarla sentetik olarak üretilmiştir; model gerçek motor sensör verisiyle
+  doğrulanmamıştır.
+- Fiziksel model (ısınma ve soğuma katsayıları) basitleştirilmiş bir termal modeldir.
+- CAN Bus katmanı bir simülasyondur; gerçek bir araç ağına bağlanmamıştır.
+- Sonraki adım: gerçek sensör verisiyle test ve model doğrulaması.
+
+## Sürüm Geçmişi
+
+### v2.4 (güncel)
+- Model mimarisi: 7→64→32→16, LayerNorm, ayrı kontrol ve arıza başlıkları.
+- Eğitim verisi 54'ten 3.000 örneğe çıkarıldı.
+- Eğitim döngüsüne kosinüs zamanlayıcı, gradyan kırpma ve model kaydetme eklendi.
+- PID'ye anti-windup sınırı eklendi.
+- Fail-safe eşikleri güncellendi, düşük voltaj kontrolü eklendi.
+- CAN Bus simülasyonu ve stres testleri eklendi.
+- Canlı dashboard ile önceki sürümdeki animasyon hataları giderildi.
+
+### v2.3
+- Çok başlı mimari, PID + NN + fail-safe entegrasyonu.
+- Gürültü altında kararlılık testi ve karar eğrisi görselleştirmesi.
+
+### v1 (eski)
+- Eşik tabanlı başlangıç sürümü.
